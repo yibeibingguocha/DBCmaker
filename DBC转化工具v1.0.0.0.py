@@ -258,8 +258,8 @@ def column_name_to_index(column_name, headers, used_indices=None):
         idx = int(column_name) - 1
         return idx if idx not in used_indices else None
     
-    # 如果是纯英文列字母（A-Z, AA-ZZ等），且长度不超过3
-    if column_name.isalpha() and len(column_name) <= 3 and all(c.isascii() for c in column_name):
+    # 如果是纯英文列字母（A-Z, AA-ZZ等），且长度不超过2（避免将BMS/VDC/TBOX等误识别为列字母）
+    if column_name.isalpha() and len(column_name) <= 2 and all(c.isascii() for c in column_name):
         index = 0
         for char in column_name.upper():
             index = index * 26 + (ord(char) - ord('A') + 1)
@@ -298,8 +298,8 @@ def column_name_to_index(column_name, headers, used_indices=None):
             best_score = score
             best_match_idx = idx
     
-    # 只有分数达到阈值才认为匹配成功
-    if best_score >= 30 and best_match_idx is not None:
+    # 只有分数达到阈值才认为匹配成功（提高到50分，避免误匹配）
+    if best_score >= 50 and best_match_idx is not None:
         return best_match_idx
     
     return None
@@ -345,6 +345,9 @@ def calculate_match_score(search_term, header):
     
     if matched_words > 0:
         word_match_ratio = matched_words / len(search_words)
+        # 多词搜索时，要求至少70%的词匹配才能得分（更严格）
+        if len(search_words) >= 2 and word_match_ratio < 0.7:
+            return 0  # 匹配率太低，不给分
         return 40 + int(word_match_ratio * 20)  # 40-60分
     
     # 4. 中文模糊匹配
@@ -403,7 +406,7 @@ MATCH_RULES = {
     'precision': ['精度', '因子', 'precision', 'factor', '分辨率', 'scale', 'Resolution', 'resolution', 'Precision', '精度(Factor)'],
     'offset': ['偏移', '偏移量', 'offset', '初值', '初始值', 'Offset', 'offset'],
     'comment': ['description', '描述', 'Description', 'Signal Description', 'signal description', '信号描述', 'Description 描述', 'Signal Description 信号描述'],
-    'direction': ['收发方向', '方向', 'direction', 'tx/rx', 't/r', '收发', '传输方向', 'TBOX', 'BMS', 'VDC'],
+    'direction': ['TBOX', '收发方向', '方向', 'direction', 'tx/rx', 't/r', '收发', '传输方向'],
     'cycle_time': ['报文周期', '周期', 'cycle time', 'cycle_time', 'period', '报文周期时间', '发送周期', 'Msg Cycle Time', 'msg cycle time', '报文周期时间(ms)'],
     'frame_format': ['Frame Format', 'frame format', '帧格式', '帧类型', 'CAN Type', 'can type', 'Frame Format帧格式', 'frame format帧格式', '帧格式Frame Format', '帧格式frame format', 'Frame Format 帧格式', 'FrameFormat', 'frameformat']
 }
@@ -697,6 +700,16 @@ def convert_to_dbc(worksheet_list, wb):
             ('偏移量', worksheet_list[6]),
             ('注释', worksheet_list[7])
         ]
+        
+        # 检查信号长度列是否误用了报文长度关键词
+        signal_length_input = worksheet_list[4]
+        if signal_length_input:
+            signal_lower = signal_length_input.lower()
+            # 如果信号长度列包含“报文”、“message”等关键词，提示用户
+            if any(kw in signal_lower for kw in ['报文', 'message', 'msg length']):
+                print_to_textbox(f"[{sheet_name}] ⚠ 警告: '长度'列配置为'{signal_length_input}'，这看起来像报文长度列")
+                print_to_textbox(f"[{sheet_name}] ℹ 提示: '长度'列应该是信号长度（如'Bit Length'、'信号长度'）")
+                print_to_textbox(f"[{sheet_name}] ℹ 如需配置报文长度，请使用单独的'报文长度'输入框")
         
         # 可选列配置：报文长度
         optional_col_configs = [
