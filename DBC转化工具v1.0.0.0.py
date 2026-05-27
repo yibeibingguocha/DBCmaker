@@ -234,7 +234,7 @@ def get_excel_headers(filepath):
         return []
 
 
-def column_name_to_index(column_name, headers, used_indices=None):
+def column_name_to_index(column_name, headers, used_indices=None, exclude_message_length=False, is_signal_length=False):
     """
     将列名转换为列索引（支持模糊搜索）
     如果输入是列号或列字母，直接转换
@@ -244,6 +244,8 @@ def column_name_to_index(column_name, headers, used_indices=None):
         column_name: 列名或列号
         headers: 列头列表
         used_indices: 已使用的列索引集合，用于防止重复匹配
+        exclude_message_length: 是否排除报文长度相关的列（用于信号长度匹配）
+        is_signal_length: 是否是信号长度字段的匹配（用于拦截报文长度特征）
     """
     if not column_name:
         return None
@@ -256,6 +258,9 @@ def column_name_to_index(column_name, headers, used_indices=None):
     # 如果是数字，直接返回
     if column_name.isdigit():
         idx = int(column_name) - 1
+        # 检查索引是否在有效范围内
+        if idx < 0 or idx >= len(headers):
+            return None
         return idx if idx not in used_indices else None
     
     # 如果是纯英文列字母（A-Z, AA-ZZ等），且长度不超过2（避免将BMS/VDC/TBOX等误识别为列字母）
@@ -264,6 +269,9 @@ def column_name_to_index(column_name, headers, used_indices=None):
         for char in column_name.upper():
             index = index * 26 + (ord(char) - ord('A') + 1)
         idx = index - 1
+        # 检查索引是否在有效范围内
+        if idx < 0 or idx >= len(headers):
+            return None
         return idx if idx not in used_indices else None
     
     # 如果是列名，在headers中进行模糊匹配
@@ -284,6 +292,13 @@ def column_name_to_index(column_name, headers, used_indices=None):
         if idx in used_indices:
             continue
         
+        # 如果需要排除报文长度列，检查当前列头是否包含相关关键词
+        if exclude_message_length:
+            header_lower = header.lower()
+            # 排除包含“报文长度”、“Msg Length”、“Message Length”等的列
+            if any(kw in header_lower for kw in ['msg length', 'message length', '报文长度']):
+                continue  # 跳过该列，不将其作为候选
+        
         # 清理列头
         cleaned_header = header.lower().replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
         cleaned_header = ' '.join(cleaned_header.split())
@@ -292,7 +307,7 @@ def column_name_to_index(column_name, headers, used_indices=None):
         if not cleaned_header:
             continue
         
-        score = calculate_match_score(search_term_cleaned, cleaned_header)
+        score = calculate_match_score(search_term_cleaned, cleaned_header, is_signal_length=is_signal_length)
         
         if score > best_score:
             best_score = score
@@ -305,7 +320,7 @@ def column_name_to_index(column_name, headers, used_indices=None):
     return None
 
 
-def calculate_match_score(search_term, header):
+def calculate_match_score(search_term, header, is_signal_length=False):
     """
     计算搜索词与列头的匹配分数（0-100）
     
@@ -314,8 +329,24 @@ def calculate_match_score(search_term, header):
     - 包含匹配：70-90分
     - 关键词匹配：40-60分
     - 中文模糊匹配：30-50分
+    
+    Args:
+        search_term: 搜索词
+        header: 列头
+        is_signal_length: 是否是信号长度字段的匹配（用于拦截报文长度特征）
     """
     import re
+    
+    # 特殊规则：如果搜索词同时包含“报文”和“长度”相关词汇，判定为报文长度列
+    # 只有在匹配信号长度时才拦截，报文长度列不应该被拦截
+    if is_signal_length:
+        search_lower = search_term.lower()
+        has_message_keyword = any(kw in search_lower for kw in ['报文', 'message', 'msg'])
+        has_length_keyword = any(kw in search_lower for kw in ['长度', 'length'])
+        
+        if has_message_keyword and has_length_keyword:
+            # 这是报文长度列的特征，不应作为信号长度列匹配
+            return 0
     
     # 1. 精确匹配（100分）
     if search_term == header:
@@ -401,7 +432,7 @@ MATCH_RULES = {
     'message_id': ['报文id', '消息id', 'message id', 'message_id', 'can id', 'can_id', 'id', '帧id', '帧 ID', '报文标识符', 'Msg ID', 'msg id', 'Message ID', '报文ID'],
     'signal_name': ['信号名称', '信号名', 'signal name', 'signal_name', 'sig name', '参数名称', '参数名', 'Signal Name', 'signal name', 'Norminal Signal name', '信号简称', 'Norminal Signal name 信号简称'],
     'start_bit': ['起始位', '起始bit', 'start bit', 'start_bit', '开始位', '起始位置', 'Start Bit', 'start bit', '起始字节', 'Start Byte', 'Start Bit 起始位'],
-    'length': ['长度', '信号长度', 'length', 'bit length', '位长', '位数', 'Bit Length', 'bit length', '信号长度(Bit)'],
+    'length': ['Bit Length(Bit)信号长度', 'Bit Length', 'bit length', '信号长度', '信号长度(Bit)', '长度', 'length', '位长', '位数'],
     'message_length': ['报文长度', 'Msg Length', 'Msg Length(Byte)', 'Msg Length(Byte) 报文长度', '报文长度(Byte)', 'Message Length', 'message length'],
     'precision': ['精度', '因子', 'precision', 'factor', '分辨率', 'scale', 'Resolution', 'resolution', 'Precision', '精度(Factor)'],
     'offset': ['偏移', '偏移量', 'offset', '初值', '初始值', 'Offset', 'offset'],
@@ -460,11 +491,17 @@ def auto_detect_columns_silent(filepath):
             'comment', 'direction', 'cycle_time', 'frame_format'
         ]
         
+        # 调试日志
+        print(f"\n[自动检测] 开始匹配列名，Excel共有{len(headers)}列")
+        
         for field in field_priority:
             keywords = MATCH_RULES[field]
             best_match = None
             best_score = 0
             best_col_idx = -1
+            
+            print(f"\n[自动检测] 匹配字段: {field}")
+            print(f"[自动检测] 关键词列表: {keywords[:3]}...")  # 只显示前3个
             
             for col_idx, header in enumerate(headers):
                 # 跳过已使用的列
@@ -477,24 +514,49 @@ def auto_detect_columns_silent(filepath):
                 header_lower = header.lower()
                 score = 0
                 
+                # 特殊处理：信号长度(length)字段应该排除报文长度相关的列
+                if field == 'length':
+                    # 检查列头是否包含报文长度特征
+                    has_message_kw = any(kw in header_lower for kw in ['msg', 'message', '报文'])
+                    has_length_kw = any(kw in header_lower for kw in ['length', '长度'])
+                    if has_message_kw and has_length_kw:
+                        print(f"[自动检测]   列{col_idx} '{header}' - 检测到报文长度特征，跳过")
+                        continue  # 跳过该列
+                
                 for keyword in keywords:
-                    if header_lower == keyword.lower():
+                    keyword_lower = keyword.lower()
+                    if header_lower == keyword_lower:
                         score = 100
+                        print(f"[自动检测]   列{col_idx} '{header}' - 精确匹配 '{keyword}'，得分100")
                         break
-                    elif keyword.lower() in header_lower:
-                        score = max(score, 50)
-                    elif header_lower in keyword.lower():
-                        score = max(score, 30)
+                    elif keyword_lower in header_lower:
+                        new_score = 50
+                        # 计算包含比例，比例越高分数越高
+                        ratio = len(keyword_lower) / len(header_lower)
+                        new_score = 50 + int(ratio * 20)  # 50-70分
+                        if new_score > score:
+                            score = new_score
+                            print(f"[自动检测]   列{col_idx} '{header}' - 关键词'{keyword}'包含在列头中，得分{score}")
+                    elif header_lower in keyword_lower:
+                        new_score = 30
+                        ratio = len(header_lower) / len(keyword_lower)
+                        new_score = 30 + int(ratio * 15)  # 30-45分
+                        if new_score > score:
+                            score = new_score
+                            print(f"[自动检测]   列{col_idx} '{header}' - 列头包含在关键词'{keyword}'中，得分{score}")
                 
                 if score > best_score:
                     best_score = score
                     best_match = header
                     best_col_idx = col_idx
             
-            # 只有分数>=30且列未被使用时才分配
-            if best_score >= 30 and best_col_idx not in used_columns:
+            # 只有分数>=50且列未被使用时才分配（提高阈值）
+            if best_score >= 50 and best_col_idx not in used_columns:
                 matched_columns[field] = best_match
                 used_columns.add(best_col_idx)
+                print(f"[自动检测] ✓ {field}: 匹配到 '{best_match}' (列{best_col_idx})，得分{best_score}")
+            else:
+                print(f"[自动检测] ✗ {field}: 未找到合适匹配（最高得分{best_score}）")
         
         return matched_columns
         
@@ -721,7 +783,14 @@ def convert_to_dbc(worksheet_list, wb):
         for col_name, col_value in col_configs:
             if col_value:
                 print_to_textbox(f"[{sheet_name}] [DEBUG] 匹配{col_name}: 搜索词='{col_value}'")
-                col_idx = column_name_to_index(col_value, headers, used_indices)
+                
+                # 特殊处理：信号长度列应该排除报文长度相关的列
+                exclude_message_length = (col_name == '长度')
+                is_signal_length = (col_name == '长度')  # 标记是否为信号长度匹配
+                
+                col_idx = column_name_to_index(col_value, headers, used_indices, 
+                                              exclude_message_length=exclude_message_length,
+                                              is_signal_length=is_signal_length)
                 
                 # 如果用户输入的值匹配失败，尝试使用预定义关键词回退匹配
                 if col_idx is None:
@@ -752,6 +821,10 @@ def convert_to_dbc(worksheet_list, wb):
                         for keyword in MATCH_RULES[field_key]:
                             fallback_idx = column_name_to_index(keyword, headers, used_indices)
                             if fallback_idx is not None:
+                                # 边界检查：确保索引在有效范围内
+                                if fallback_idx < 0 or fallback_idx >= len(headers):
+                                    continue
+                                
                                 # 计算匹配分数（简单起见，使用包含关系）
                                 header_lower = headers[fallback_idx].lower()
                                 keyword_lower = keyword.lower()
@@ -836,13 +909,20 @@ def convert_to_dbc(worksheet_list, wb):
                 print_to_textbox(f"[{sheet_name}] ℹ 自动检测到报文长度列: '{message_length_col_name}'")
         
         if message_length_col_name:
-            current_message_length_col = column_name_to_index(message_length_col_name, headers, used_indices)
+            print_to_textbox(f"[{sheet_name}] [DEBUG] 尝试匹配报文长度列，搜索词: '{message_length_col_name}'")
+            print_to_textbox(f"[{sheet_name}] [DEBUG] 已使用的列索引: {used_indices}")
+            current_message_length_col = column_name_to_index(message_length_col_name, headers, used_indices, 
+                                                              is_signal_length=False)
             if current_message_length_col is not None:
                 used_indices.add(current_message_length_col)
                 actual_header = headers[current_message_length_col] if current_message_length_col < len(headers) else "未知"
                 print_to_textbox(f"[{sheet_name}] ✓ 报文长度列: 搜索'{message_length_col_name}' -> 匹配到列'{actual_header}' (索引{current_message_length_col})")
             else:
                 print_to_textbox(f"[{sheet_name}] ⚠ 未找到报文长度列: '{message_length_col_name}'")
+                # 输出所有包含'length'或'长度'的列头，帮助调试
+                matching_headers = [(i, h) for i, h in enumerate(headers) if 'length' in h.lower() or '长度' in h]
+                if matching_headers:
+                    print_to_textbox(f"[{sheet_name}] [提示] 找到包含'length/长度'的列: {matching_headers}")
         
         # 检测当前Sheet是否为CAN FD
         is_can_fd = False
