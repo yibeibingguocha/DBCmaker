@@ -299,6 +299,7 @@ def column_name_to_index(column_name, headers, used_indices=None, exclude_messag
     best_score = 0
     
     for idx, header in enumerate(headers):
+        
         # 跳过已使用的列
         if idx in used_indices:
             continue
@@ -378,24 +379,67 @@ def calculate_match_score(search_term, header, is_signal_length=False):
     search_words = search_term.split()
     header_words = header.split()
     
+    # 进一步优化：将中英文混合的词拆分，提高匹配率
+    # 例如：'报文id' -> ['报文', 'id']
+    def split_mixed_words(word_list):
+        result = []
+        for word in word_list:
+            # 提取所有中文部分
+            chinese_parts = re.findall(r'[\u4e00-\u9fff]+', word)
+            # 提取所有英文/数字部分
+            english_parts = re.findall(r'[a-zA-Z0-9]+', word)
+            result.extend(chinese_parts)
+            result.extend(english_parts)
+        return result if result else word_list
+    
+    search_words_expanded = split_mixed_words(search_words)
+    header_words_expanded = split_mixed_words(header_words)
+    
     matched_words = 0
-    for sw in search_words:
-        for hw in header_words:
-            if sw in hw or hw in sw:
+    for sw in search_words_expanded:
+        for hw in header_words_expanded:
+            if sw.lower() in hw.lower() or hw.lower() in sw.lower():
                 matched_words += 1
                 break
     
-    if matched_words > 0:
-        word_match_ratio = matched_words / len(search_words)
-        # 多词搜索时，要求至少70%的词匹配才能得分（更严格）
-        if len(search_words) >= 2 and word_match_ratio < 0.7:
-            return 0  # 匹配率太低，不给分
-        return 40 + int(word_match_ratio * 20)  # 40-60分
+    word_match_ratio = 0
+    base_score = 0  # 初始化base_score
     
-    # 4. 中文模糊匹配
+    if matched_words > 0:
+        word_match_ratio = matched_words / len(search_words_expanded)
+        # 多词搜索时，如果匹配率达到50%以上，给予基础分数
+        if len(search_words_expanded) >= 2 and word_match_ratio >= 0.5:
+            base_score = 40 + int(word_match_ratio * 20)  # 40-60分
+            # 继续检查是否有中文模糊匹配可以提升分数
+        elif len(search_words_expanded) >= 2 and word_match_ratio < 0.5:
+            # 匹配率太低，但不直接返回0，而是继续尝试中文匹配
+            base_score = 0
+        elif len(search_words_expanded) == 1:
+            # 单个词的匹配，根据匹配情况给分
+            base_score = 40 + int(word_match_ratio * 20)
+    
+    # 新增：整体包含匹配检查（最高优先级）
+    # 如果搜索词的核心部分完全包含在列头中，给予高分
+    # 例如：'signal name' 包含在 'norminal signal name 信号简称' 中
+    search_core_parts = []
+    for word in search_words_expanded:
+        # 只考虑长度>=2的英文词或任何中文词
+        if len(word) >= 2 or re.search(r'[\u4e00-\u9fff]', word):
+            search_core_parts.append(word.lower())
+    
+    if search_core_parts:
+        # 检查是否所有核心部分都出现在列头中
+        all_found = all(any(part in hw.lower() for hw in header_words_expanded) for part in search_core_parts)
+        if all_found and len(search_core_parts) >= 2:
+            # 如果所有核心词都找到了，给予高分
+            inclusion_score = 80 + min(20, len(search_core_parts) * 5)  # 80-100分
+            base_score = max(base_score, inclusion_score)
+    
+    # 4. 中文模糊匹配（即使英文匹配率低，也要尝试中文匹配）
     chinese_in_search = re.findall(r'[\u4e00-\u9fff]+', search_term)
     chinese_in_header = re.findall(r'[\u4e00-\u9fff]+', header)
     
+    chinese_score = 0
     if chinese_in_search and chinese_in_header:
         max_score = 0
         for search_cn in chinese_in_search:
@@ -404,9 +448,12 @@ def calculate_match_score(search_term, header, is_signal_length=False):
                 max_score = max(max_score, score)
         
         if max_score > 0:
-            return 30 + int(max_score * 20)  # 30-50分
+            chinese_score = 30 + int(max_score * 20)  # 30-50分
     
-    return 0
+    # 综合评分：取英文匹配和中文匹配的较高者
+    final_score = max(base_score, chinese_score)
+    
+    return final_score
 
 
 def calculate_chinese_similarity(search_cn, header_cn):
@@ -417,7 +464,7 @@ def calculate_chinese_similarity(search_cn, header_cn):
     if search_cn == header_cn:
         return 1.0
     
-    # 子串关系
+    # 子串关系（双向检查）
     if search_cn in header_cn or header_cn in search_cn:
         shorter = min(len(search_cn), len(header_cn))
         longer = max(len(search_cn), len(header_cn))
@@ -434,7 +481,70 @@ def calculate_chinese_similarity(search_cn, header_cn):
     if common_prefix_len >= 2:
         return common_prefix_len / max(len(search_cn), len(header_cn))
     
+    # 新增：字符级别的部分匹配（对于短字符串更有效）
+    # 计算共同字符数
+    common_chars = sum(1 for c in search_cn if c in header_cn)
+    if common_chars > 0:
+        char_ratio = common_chars / max(len(search_cn), len(header_cn))
+        # 如果有一定比例的字符相同，给予一定分数
+        if char_ratio >= 0.5:  # 至少50%的字符相同
+            return char_ratio * 0.8  # 降低权重，避免误匹配
+    
     return 0
+
+
+def column_name_to_index_with_fallback(column_name, headers, field_key, used_indices=None):
+    """
+    将列名转换为列索引，支持回退匹配
+    
+    Args:
+        column_name: 用户输入的列名
+        headers: 列头列表
+        field_key: 字段类型（如'message_name', 'precision'等）
+        used_indices: 已使用的列索引集合
+    
+    Returns:
+        列索引，如果匹配失败返回None
+    """
+    if used_indices is None:
+        used_indices = set()
+    
+    # 首先尝试直接匹配
+    col_idx = column_name_to_index(column_name, headers, used_indices)
+    if col_idx is not None:
+        return col_idx
+    
+    # 如果直接匹配失败，尝试回退匹配
+    if field_key and field_key in MATCH_RULES:
+        best_fallback_idx = None
+        best_fallback_score = 0
+        
+        # 遍历所有未使用的列
+        for idx, header in enumerate(headers):
+            if idx in used_indices:
+                continue
+            
+            # 清理列头
+            header_cleaned = header.lower().replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+            header_cleaned = ' '.join(header_cleaned.split())
+            
+            # 跳过空列头
+            if not header_cleaned:
+                continue
+            
+            # 对每个关键词计算与当前列头的匹配分数
+            for keyword in MATCH_RULES[field_key]:
+                score = calculate_match_score(keyword.lower(), header_cleaned, is_signal_length=False)
+                
+                if score > best_fallback_score:
+                    best_fallback_score = score
+                    best_fallback_idx = idx
+        
+        # 只有分数>=50才认为匹配成功
+        if best_fallback_idx is not None and best_fallback_score >= 50:
+            return best_fallback_idx
+    
+    return None
 
 
 # 全局变量：列名匹配规则（用于自动检测和回退匹配）
@@ -617,6 +727,10 @@ def load_sheets_and_columns(excel_path):
         
         # 读取所有Sheet的列名
         sheet_names = wb.sheetnames
+        print_to_textbox(f"\n========== Excel文件信息 ==========")
+        print_to_textbox(f"文件路径: {excel_path}")
+        print_to_textbox(f"Sheet数量: {len(sheet_names)}")
+        
         for idx, sheet_name in enumerate(sheet_names):
             sheet = wb[sheet_name]
             headers = []
@@ -626,6 +740,15 @@ def load_sheets_and_columns(excel_path):
                 else:
                     headers.append("")
             sheet_headers[sheet_name] = headers
+            
+            # 输出该Sheet的列名信息
+            non_empty_headers = [h for h in headers if h]
+            print_to_textbox(f"\n[Sheet {idx+1}] {sheet_name} (共{len(headers)}列，有效列{len(non_empty_headers)}个)")
+            # 只显示前20个列名，避免日志过长
+            display_headers = non_empty_headers[:20]
+            print_to_textbox(f"  列名预览: {display_headers}")
+            if len(non_empty_headers) > 20:
+                print_to_textbox(f"  ... 还有{len(non_empty_headers) - 20}个列未显示")
             
             # 创建单选按钮（Radio Button）- 只能选中一个Sheet来查看其匹配结果
             # 注意：这只是用于查看，不影响实际处理（所有Sheet都会被处理）
@@ -654,8 +777,19 @@ def on_sheet_select(sheet_name):
     global current_active_sheet
     
     current_active_sheet = sheet_name
+    print_to_textbox(f"\n========== 切换到Sheet: {sheet_name} ==========")
+    print_to_textbox(f"总列数: {len(sheet_headers[sheet_name])}")
+    
+    # 显示该Sheet的所有列名（完整列表）
+    headers = sheet_headers[sheet_name]
+    non_empty = [(i, h) for i, h in enumerate(headers) if h]
+    print_to_textbox(f"有效列数: {len(non_empty)}")
+    print_to_textbox("列名列表:")
+    for idx, header in non_empty:
+        print_to_textbox(f"  [{idx}] {header}")
+    
     update_column_comboboxes_for_sheet(sheet_name)
-    print_to_textbox(f"✓ 切换到Sheet: '{sheet_name}' (共{len(sheet_headers[sheet_name])}列)")
+    print_to_textbox(f"✓ Sheet切换完成，请查看上方列名列表和下方的匹配结果")
 
 
 def update_column_comboboxes_for_sheet(sheet_name):
@@ -684,30 +818,29 @@ def update_column_comboboxes_for_sheet(sheet_name):
     # 如果该Sheet已经有保存的匹配结果，恢复显示
     if sheet_name in sheet_column_matches:
         matches = sheet_column_matches[sheet_name]
-        if matches.get('message_name'):
-            input_message_name_entry.set(matches['message_name'])
-        if matches.get('message_id'):
-            input_message_id_entry.set(matches['message_id'])
-        if matches.get('signal_name'):
-            input_signal_name_entry.set(matches['signal_name'])
-        if matches.get('start_bit'):
-            input_start_bit_entry.set(matches['start_bit'])
-        if matches.get('length'):
-            input_length_entry.set(matches['length'])
-        if matches.get('precision'):
-            input_precision_entry.set(matches['precision'])
-        if matches.get('offset'):
-            input_offset_entry.set(matches['offset'])
-        if matches.get('comment'):
-            input_comment_entry.set(matches['comment'])
-        if matches.get('direction'):
-            input_direction_entry.set(matches['direction'])
-        if matches.get('cycle_time'):
-            input_cycle_time_entry.set(matches['cycle_time'])
-        if matches.get('frame_format'):
-            input_frame_format_entry.set(matches['frame_format'])
-        if matches.get('message_length'):
-            input_message_length_entry.set(matches['message_length'])
+        
+        # 验证每个保存的列名是否在当前Sheet中存在
+        def validate_and_set(entry, column_name, field_label):
+            """验证列名是否存在于当前Sheet中，存在则设置，否则清空并提示"""
+            if column_name and column_name in headers:
+                entry.set(column_name)
+            else:
+                if column_name:  # 只有当之前有值但现在不存在时才提示
+                    print_to_textbox(f"⚠ [{sheet_name}] '{field_label}'的列名'{column_name}'在当前Sheet中不存在，已清空")
+                entry.set('')  # 列名不存在，清空
+        
+        validate_and_set(input_message_name_entry, matches.get('message_name'), '报文名称')
+        validate_and_set(input_message_id_entry, matches.get('message_id'), '报文ID')
+        validate_and_set(input_signal_name_entry, matches.get('signal_name'), '信号名称')
+        validate_and_set(input_start_bit_entry, matches.get('start_bit'), '起始位')
+        validate_and_set(input_length_entry, matches.get('length'), '信号长度')
+        validate_and_set(input_precision_entry, matches.get('precision'), '精度')
+        validate_and_set(input_offset_entry, matches.get('offset'), '偏移量')
+        validate_and_set(input_comment_entry, matches.get('comment'), '注释')
+        validate_and_set(input_direction_entry, matches.get('direction'), '收发方向')
+        validate_and_set(input_cycle_time_entry, matches.get('cycle_time'), '报文周期')
+        validate_and_set(input_frame_format_entry, matches.get('frame_format'), '帧格式')
+        validate_and_set(input_message_length_entry, matches.get('message_length'), '报文长度')
     else:
         # 首次加载，清空下拉框
         for combo in all_combos:
@@ -728,11 +861,31 @@ def auto_detect_for_sheet(sheet_name):
     
     headers = sheet_headers[sheet_name]
     
+    print_to_textbox(f"\n[{sheet_name}] ========== 开始自动检测列名 ==========")
+    
     # 使用现有的自动检测逻辑
     matched = auto_detect_columns_from_headers(headers)
     
     if matched:
         sheet_column_matches[sheet_name] = matched
+        print_to_textbox(f"[{sheet_name}] ✓ 自动检测完成，匹配结果:")
+        for field, col_name in matched.items():
+            field_names = {
+                'message_name': '报文名称',
+                'message_id': '报文ID',
+                'signal_name': '信号名称',
+                'start_bit': '起始位',
+                'length': '信号长度',
+                'precision': '精度',
+                'offset': '偏移量',
+                'comment': '注释',
+                'direction': '收发方向',
+                'cycle_time': '报文周期',
+                'frame_format': '帧格式',
+                'message_length': '报文长度'
+            }
+            cn_name = field_names.get(field, field)
+            print_to_textbox(f"  {cn_name}: {col_name}")
         
         # 更新下拉框显示
         if matched.get('message_name'):
@@ -759,6 +912,10 @@ def auto_detect_for_sheet(sheet_name):
             input_frame_format_entry.set(matched['frame_format'])
         if matched.get('message_length'):
             input_message_length_entry.set(matched['message_length'])
+        
+        print_to_textbox(f"[{sheet_name}] ✓ 匹配结果已填充到下拉框")
+    else:
+        print_to_textbox(f"[{sheet_name}] ✗ 自动检测失败，请手动选择列名")
 
 
 def auto_detect_columns_from_headers(headers):
@@ -1120,31 +1277,34 @@ def convert_to_dbc(worksheet_list, wb):
                         # 遍历所有关键词，找到最佳匹配
                         best_fallback_idx = None
                         best_fallback_score = 0
-                        for keyword in MATCH_RULES[field_key]:
-                            fallback_idx = column_name_to_index(keyword, headers, used_indices)
-                            if fallback_idx is not None:
-                                # 边界检查：确保索引在有效范围内
-                                if fallback_idx < 0 or fallback_idx >= len(headers):
-                                    continue
-                                
-                                # 计算匹配分数（简单起见，使用包含关系）
-                                header_lower = headers[fallback_idx].lower()
-                                keyword_lower = keyword.lower()
-                                if keyword_lower in header_lower:
-                                    score = 50
-                                elif header_lower in keyword_lower:
-                                    score = 30
-                                else:
-                                    score = 10
+                        
+                        # 遍历所有未使用的列
+                        for idx, header in enumerate(headers):
+                            if idx in used_indices:
+                                continue
+                            
+                            # 清理列头
+                            header_cleaned = header.lower().replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+                            header_cleaned = ' '.join(header_cleaned.split())
+                            
+                            # 跳过空列头
+                            if not header_cleaned:
+                                continue
+                            
+                            # 对每个关键词计算与当前列头的匹配分数
+                            for keyword in MATCH_RULES[field_key]:
+                                score = calculate_match_score(keyword.lower(), header_cleaned, is_signal_length=False)
                                 
                                 if score > best_fallback_score:
                                     best_fallback_score = score
-                                    best_fallback_idx = fallback_idx
+                                    best_fallback_idx = idx
                         
-                        if best_fallback_idx is not None:
+                        if best_fallback_idx is not None and best_fallback_score >= 50:
                             col_idx = best_fallback_idx
                             actual_header = headers[col_idx] if col_idx < len(headers) else "未知"
-                            print_to_textbox(f"[{sheet_name}] ✓ {col_name}: 回退匹配到列'{actual_header}' (索引{col_idx})，使用关键词: '{MATCH_RULES[field_key][0]}'")
+                            print_to_textbox(f"[{sheet_name}] ✓ {col_name}: 回退匹配到列'{actual_header}' (索引{col_idx})，得分{best_fallback_score}")
+                        else:
+                            print_to_textbox(f"[{sheet_name}] ✗ {col_name}: 回退匹配失败，所有关键词都无法匹配")
                 
                 if col_idx is not None:
                     col_indices.append(col_idx)
@@ -1189,7 +1349,7 @@ def convert_to_dbc(worksheet_list, wb):
         
         if frame_format_col_name:
             print_to_textbox(f"[{sheet_name}] [DEBUG] 尝试匹配帧格式列，搜索词: '{frame_format_col_name}'")
-            current_frame_format_col_index = column_name_to_index(frame_format_col_name, headers, used_indices)
+            current_frame_format_col_index = column_name_to_index_with_fallback(frame_format_col_name, headers, 'frame_format', used_indices)
             if current_frame_format_col_index is not None:
                 used_indices.add(current_frame_format_col_index)
                 actual_header = headers[current_frame_format_col_index] if current_frame_format_col_index < len(headers) else "未知"
@@ -1205,7 +1365,7 @@ def convert_to_dbc(worksheet_list, wb):
         message_length_col_name = worksheet_list[14] if len(worksheet_list) > 14 and worksheet_list[14] else None
         if not message_length_col_name:
             # 尝试自动匹配报文长度列
-            auto_matched = auto_detect_columns_silent(filepath)
+            auto_matched = auto_detect_columns_silent(excel_file_path)
             if auto_matched and auto_matched.get('message_length'):
                 message_length_col_name = auto_matched['message_length']
                 print_to_textbox(f"[{sheet_name}] ℹ 自动检测到报文长度列: '{message_length_col_name}'")
@@ -1213,8 +1373,7 @@ def convert_to_dbc(worksheet_list, wb):
         if message_length_col_name:
             print_to_textbox(f"[{sheet_name}] [DEBUG] 尝试匹配报文长度列，搜索词: '{message_length_col_name}'")
             print_to_textbox(f"[{sheet_name}] [DEBUG] 已使用的列索引: {used_indices}")
-            current_message_length_col = column_name_to_index(message_length_col_name, headers, used_indices, 
-                                                              is_signal_length=False)
+            current_message_length_col = column_name_to_index_with_fallback(message_length_col_name, headers, 'message_length', used_indices)
             if current_message_length_col is not None:
                 used_indices.add(current_message_length_col)
                 actual_header = headers[current_message_length_col] if current_message_length_col < len(headers) else "未知"
@@ -1643,6 +1802,8 @@ def submit_main():
     # 将列名转换为列索引
     converted_list = []
     field_names = ['报文名称', '报文ID', '信号名称', '起始地址', '信号长度', '精度', '偏移量', '注释']
+    field_keys = ['message_name', 'message_id', 'signal_name', 'start_bit', 'length', 'precision', 'offset', 'comment']
+    used_indices = set()  # 跟踪已使用的列索引
     
     
     # 处理前8个基本列配置（索引0-7）
@@ -1653,7 +1814,8 @@ def submit_main():
             print_to_textbox(f"⚠ {field_names[idx]}: 未设置")
             continue
         
-        col_index = column_name_to_index(item, headers)
+        # 使用带fallback的匹配函数
+        col_index = column_name_to_index_with_fallback(item, headers, field_keys[idx], used_indices)
         
         if col_index is None:
             if idx == 7:  # 注释列是可选的
@@ -1671,6 +1833,7 @@ def submit_main():
             return
         
         converted_list.append(col_index)
+        used_indices.add(col_index)  # 标记该列为已使用
         print_to_textbox(f"✓ {field_names[idx]}: '{item}' -> 列索引 {col_index} (列名: {headers[col_index]})")
     
     # 处理方向列（索引11）
@@ -1679,7 +1842,7 @@ def submit_main():
         converted_list.append(None)
         print_to_textbox(f"⚠ 收发方向列: 未设置，将默认所有报文为发送(T)")
     else:
-        direction_col_index = column_name_to_index(direction_col_name, headers)
+        direction_col_index = column_name_to_index_with_fallback(direction_col_name, headers, 'direction', used_indices)
         if direction_col_index is None:
             print_to_textbox(f"⚠ 收发方向列: '{direction_col_name}' 未识别，将默认所有报文为发送(T)")
             converted_list.append(None)
@@ -1687,6 +1850,7 @@ def submit_main():
             print_to_textbox(f"❌ 错误: 收发方向列索引 {direction_col_index} 超出范围")
             return
         else:
+            used_indices.add(direction_col_index)
             converted_list.append(direction_col_index)
             print_to_textbox(f"✓ 收发方向: '{direction_col_name}' -> 列索引 {direction_col_index} (列名: {headers[direction_col_index]})")
     
@@ -1696,7 +1860,7 @@ def submit_main():
         converted_list.append(None)
         print_to_textbox(f"⚠ 报文周期列: 未设置，将不生成周期属性")
     else:
-        cycle_col_index = column_name_to_index(cycle_col_name, headers)
+        cycle_col_index = column_name_to_index_with_fallback(cycle_col_name, headers, 'cycle_time', used_indices)
         if cycle_col_index is None:
             print_to_textbox(f"⚠ 报文周期列: '{cycle_col_name}' 未识别，将不生成周期属性")
             converted_list.append(None)
@@ -1707,6 +1871,7 @@ def submit_main():
             # 检查是否与方向列冲突
             if len(converted_list) > 8 and converted_list[8] is not None and cycle_col_index == converted_list[8]:
                 print_to_textbox(f"⚠ 警告: 报文周期列与收发方向列使用同一列 (索引{cycle_col_index})")
+            used_indices.add(cycle_col_index)
             converted_list.append(cycle_col_index)
             print_to_textbox(f"✓ 报文周期: '{cycle_col_name}' -> 列索引 {cycle_col_index} (列名: {headers[cycle_col_index]})")
     
