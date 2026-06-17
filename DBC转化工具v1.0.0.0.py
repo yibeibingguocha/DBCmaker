@@ -1360,6 +1360,39 @@ def convert_to_dbc(worksheet_list, wb):
                 matching_headers = [(i, h) for i, h in enumerate(headers) if 'frame' in h.lower() or '格式' in h]
                 if matching_headers:
                     print_to_textbox(f"[{sheet_name}] [提示] 找到可能相关的列: {matching_headers}")
+        else:
+            # 用户没有指定帧格式列，尝试自动匹配
+            print_to_textbox(f"[{sheet_name}] ℹ 用户未指定帧格式列，尝试自动检测...")
+            best_match_idx = None
+            best_match_score = 0
+            
+            for idx, header in enumerate(headers):
+                if idx in used_indices:
+                    continue
+                
+                # 清理列头
+                header_cleaned = header.lower().replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+                header_cleaned = ' '.join(header_cleaned.split())
+                
+                # 跳过空列头
+                if not header_cleaned:
+                    continue
+                
+                # 遍历MATCH_RULES中的所有关键词
+                for keyword in MATCH_RULES.get('frame_format', []):
+                    score = calculate_match_score(keyword.lower(), header_cleaned, is_signal_length=False)
+                    if score > best_match_score:
+                        best_match_score = score
+                        best_match_idx = idx
+            
+            # 只有分数>=50才认为匹配成功
+            if best_match_idx is not None and best_match_score >= 50:
+                current_frame_format_col_index = best_match_idx
+                used_indices.add(current_frame_format_col_index)
+                actual_header = headers[current_frame_format_col_index] if current_frame_format_col_index < len(headers) else "未知"
+                print_to_textbox(f"[{sheet_name}] ✓ 自动检测到帧格式列: '{actual_header}' (索引{current_frame_format_col_index})，得分{best_match_score}")
+            else:
+                print_to_textbox(f"[{sheet_name}] ⚠ 未自动检测到帧格式列，将使用标准CAN格式")
         
         # 可选列：报文长度（如果用户没有指定，则尝试自动匹配）
         message_length_col_name = worksheet_list[14] if len(worksheet_list) > 14 and worksheet_list[14] else None
@@ -1395,6 +1428,7 @@ def convert_to_dbc(worksheet_list, wb):
                     format_value = row[current_frame_format_col_index]
                     if format_value is not None:
                         format_str = str(format_value).strip().upper()
+                        print_to_textbox(f"  [DEBUG] {sheet_name} 第一行帧格式原始值: '{format_value}', 处理后: '{format_str}'")
                         if 'FD' in format_str or 'CAN_FD' in format_str or 'CANFD' in format_str:
                             is_can_fd = True
                             print_to_textbox(f"  [FD] {sheet_name} 检测到CAN FD格式")
@@ -1548,6 +1582,7 @@ def convert_to_dbc(worksheet_list, wb):
                             format_cell = row[current_frame_format_col_index]
                             if format_cell is not None:
                                 format_str = str(format_cell).strip().upper()
+                                print_to_textbox(f"  [DEBUG] CAN ID 0x{can_id_int:X} 帧格式原始值: '{format_cell}', 处理后: '{format_str}'")
                                 # 根据帧格式内容设置对应的枚举值
                                 # StandardCAN=0, ExtendedCAN=1, StandardCAN_FD=14, ExtendedCAN_FD=15
                                 frame_format_value = 0  # 默认StandardCAN
@@ -1561,7 +1596,7 @@ def convert_to_dbc(worksheet_list, wb):
                                 
                                 ba_rows.append(f'BA_ "VFrameFormat" BO_ {can_id_int} {frame_format_value};')
                                 format_names = {0: 'StandardCAN', 1: 'ExtendedCAN', 14: 'StandardCAN_FD', 15: 'ExtendedCAN_FD'}
-                                print_to_textbox(f"  [FORMAT] CAN ID 0x{can_id_int:X} 设置为{format_names.get(frame_format_value, 'Unknown')}格式")
+                                print_to_textbox(f"  [FORMAT] CAN ID 0x{can_id_int:X} 设置为{format_names.get(frame_format_value, 'Unknown')}格式 (值={frame_format_value})")
                         except Exception as e:
                             print_to_textbox(f"  [!] 读取帧格式失败: {e}")
                     
